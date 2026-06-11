@@ -1,12 +1,13 @@
 import { Router } from 'express';
 import { getSql, isDBConnected } from '../db';
 import { readData, writeData } from '../store';
-import { isSupabaseConfigured, getUserByEmail, createUser, addPushToken, getUserTokens } from '../supabase';
+import { isSupabaseConfigured, getUserByEmail, createUser, addPushToken, getUserTokens, findOrCreateGoogleUser } from '../supabase';
 import { shouldUseSupabase, isFileFallbackDisabled } from '../dbAdapter';
 import { id } from '../utils/id';
 import { getJwtSecret } from '../middleware/auth';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
+import axios from 'axios';
 
 const router = Router();
 
@@ -74,6 +75,7 @@ router.post('/login', async (req, res) => {
     try {
       const user = await getUserByEmail(email);
       if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+      if (!user.password_hash) return res.status(400).json({ error: 'This account uses Google sign-in. Please continue with Google.' });
       const ok = bcrypt.compareSync(password, user.password_hash as string);
       if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
       const role = user.role ?? 'user';
@@ -151,6 +153,79 @@ router.post('/register-token', async (req: any, res: any) => {
     return res.json({ ok: true, added: false });
   } catch {
     return res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+const GOOGLE_CALLBACK = 'https://eternal-care-be.vercel.app/auth/google/callback';
+
+router.get('/google', (req, res) => {
+  if (!process.env.GOOGLE_CLIENT_ID)
+    return res.status(500).json({ error: 'Google OAuth not configured' });
+
+  const state = jwt.sign({ csrf: true }, getJwtSecret(), { expiresIn: '10m' });
+
+  const params = new URLSearchParams({
+    client_id: process.env.GOOGLE_CLIENT_ID,
+    redirect_uri: GOOGLE_CALLBACK,
+    response_type: 'code',
+    scope: 'openid email profile',
+    state,
+    access_type: 'online',
+    prompt: 'select_account',
+  });
+
+  return res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+});
+
+router.get('/google/callback', async (req, res) => {
+  const { code, state, error: oauthError } = req.query as Record<string, string>;
+
+  if (oauthError || !code)
+    return res.redirect('eternalcare://auth?error=google_denied');
+
+  try {
+    jwt.verify(state, getJwtSecret());
+  } catch {
+    return res.redirect('eternalcare://auth?error=invalid_state');
+  }
+
+  try {
+    const tokenRes = await axios.post(
+      'https://oauth2.googleapis.com/token',
+      new URLSearchParams({
+        code,
+        client_id: process.env.GOOGLE_CLIENT_ID!,
+        client_secret: process.env.GOOGLE_CLIENT_SECRET!,
+        redirect_uri: GOOGLE_CALLBACK,
+        grant_type: 'authorization_code',
+      }).toString(),
+      { headers: { 'Content-Type': 'application/x-www-form-urlencoded' } }
+    );
+
+    const profileRes = await axios.get('https://www.googleapis.com/oauth2/v2/userinfo', {
+      headers: { Authorization: `Bearer ${tokenRes.data.access_token}` },
+    });
+
+    const { id: google_id, email, name, picture } = profileRes.data;
+    if (!email) return res.redirect('eternalcare://auth?error=no_email');
+
+    const user = await findOrCreateGoogleUser({
+      google_id,
+      email,
+      name: name || email.split('@')[0],
+      avatar_url: picture || undefined,
+    });
+
+    const appToken = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role ?? 'user' },
+      getJwtSecret(),
+      { expiresIn: '7d' }
+    );
+
+    return res.redirect(`eternalcare://auth?token=${encodeURIComponent(appToken)}`);
+  } catch (e: any) {
+    console.error('[Google OAuth]', e?.message);
+    return res.redirect('eternalcare://auth?error=server_error');
   }
 });
 

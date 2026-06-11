@@ -29,6 +29,40 @@ export function isSupabaseConfigured() {
 
 // ─── Users ────────────────────────────────────────────────────────────────────
 
+export async function findOrCreateGoogleUser(profile: {
+  google_id: string;
+  email: string;
+  name: string;
+  avatar_url?: string;
+}): Promise<any> {
+  const { data: byGid } = await getClient()
+    .from('users').select('*').eq('google_id', profile.google_id).single();
+  if (byGid) return byGid;
+
+  const { data: byEmail } = await getClient()
+    .from('users').select('*').eq('email', profile.email).single();
+  if (byEmail) {
+    const { data: linked } = await getClient()
+      .from('users').update({ google_id: profile.google_id })
+      .eq('id', byEmail.id).select().single();
+    return linked ?? byEmail;
+  }
+
+  const { data, error } = await getClient()
+    .from('users')
+    .insert({
+      id: uuidv4(),
+      name: profile.name,
+      email: profile.email,
+      google_id: profile.google_id,
+      avatar_url: profile.avatar_url ?? null,
+      password_hash: null,
+    })
+    .select().single();
+  if (error) throw new Error(error.message);
+  return data;
+}
+
 export async function getUserByEmail(email: string) {
   const { data } = await getClient().from('users').select('*').eq('email', email).single();
   return data;
